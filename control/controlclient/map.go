@@ -1001,11 +1001,42 @@ func (ms *mapSession) sortedPeers() []tailcfg.NodeView {
 	return ret
 }
 
+var metricDupKeyPeersDropped = clientmetric.NewCounter("controlclient_dup_key_peers_dropped")
+
+// dropDupKeyPeers removes peers whose node key is also used by a peer with a
+// higher node ID, modifying peers in place and returning the shortened slice.
+// The peers must be sorted by node ID, as returned by
+// [mapSession.sortedPeers].
+//
+// Control should never send two peers with the same node key; it's a server
+// bug if it does. The rest of the client (magicsock, wgengine) requires node
+// keys to be unique, so keep only the highest node ID (normally the newest
+// node) and log loudly about the rest. See
+// https://github.com/tailscale/corp/issues/52092.
+func (ms *mapSession) dropDupKeyPeers(peers []tailcfg.NodeView) []tailcfg.NodeView {
+	winner := make(map[key.NodePublic]tailcfg.NodeID, len(peers))
+	dups := false
+	for _, p := range peers {
+		if lower, ok := winner[p.Key()]; ok {
+			dups = true
+			metricDupKeyPeersDropped.Add(1)
+			ms.logf("[unexpected] controlclient: control sent peers %v and %v with the same node key %s; ignoring %v", lower, p.ID(), p.Key().ShortString(), lower)
+		}
+		winner[p.Key()] = p.ID() // later peers have higher IDs, so they win
+	}
+	if !dups {
+		return peers
+	}
+	return slices.DeleteFunc(peers, func(p tailcfg.NodeView) bool {
+		return winner[p.Key()] != p.ID()
+	})
+}
+
 // netmap returns a fully populated NetworkMap from the last state seen from
 // a call to updateStateFromResponse, filling in omitted
 // information from prior MapResponse values.
 func (ms *mapSession) netmap() *netmap.NetworkMap {
-	peerViews := ms.sortedPeers()
+	peerViews := ms.dropDupKeyPeers(ms.sortedPeers())
 
 	var msgs map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage
 	if len(ms.lastDisplayMessages) != 0 {
