@@ -130,6 +130,8 @@ const (
 	userKeyPrefix   cacheKey = "user-" // + profile ID
 	sshPolicyKey    cacheKey = "ssh"
 	packetFilterKey cacheKey = "filter"
+
+	LogPrefix string = "netmapcache: "
 )
 
 // UpdateSelfOnly updates nm in the cache, replacing any previously cached

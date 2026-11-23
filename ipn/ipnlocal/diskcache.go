@@ -173,7 +173,7 @@ func (b *LocalBackend) ClearNetmapCache(ctx context.Context) error {
 		dir := b.profileDataPathLocked(p.ID(), "netmap-cache")
 
 		// Open and clear the configured store for this profile.
-		if store, err := netmapcache.OpenStore(ctx, dir); err != nil {
+		if store, err := netmapcache.OpenStore(ctx, dir, b.logf); err != nil {
 			errs = append(errs, fmt.Errorf("open store for profile %q: %w", p.ID(), err))
 		} else if store == nil {
 			continue // store does not exist
