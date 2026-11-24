@@ -9,6 +9,11 @@
 // fails and then later passes is reported as flaky. A test that never passes
 // within the budget is a real failure and causes a non-zero exit.
 //
+// If a package's test binary doesn't complete (for example because of a
+// timeout, a panic, or a call to os.Exit), testwrapper won't retry any of its
+// tests and exits non-zero; we may not have seen every test start, and so we
+// can't reliably know the full set of tests that need re-running.
+//
 // The flakytest package's Mark API is no longer required for retries — it is
 // kept for explicit issue tracking and for the TS_SKIP_FLAKY_TESTS skip
 // behavior.
@@ -150,7 +155,17 @@ type testAttempt struct {
 	// test in the package -- or the package's own output -- did.
 	raceDetected bool
 
+	// pkgFinished is set on the final event for a package, which go test
+	// sends when the package ends for any reason (pass, fail, skip, or build
+	// failure). Such an event is about the package, not about one test. It
+	// does not mean that the test binary ran all of its tests; see
+	// binaryFinished for that.
 	pkgFinished bool
+	// binaryFinished is set on a pkgFinished event if the test binary printed
+	// the PASS or FAIL line that testing.M.Run prints after all tests run.
+	// If it is not set, the binary stopped early (for example, because of a
+	// panic or a timeout) and some tests possibly did not start.
+	binaryFinished bool
 }
 
 // failedTest tracks per-test state across the retry phase.
@@ -162,7 +177,6 @@ type failedTest struct {
 	attempts          int           // number of retry attempts run so far
 	totalRetryElapsed time.Duration // total time spent across retry attempts
 	everPassed        bool          // a retry attempt passed
-	inferredFail      bool          // the first failure was assumed, not reported by `go test`
 }
 
 // packageTests describes what to run.
@@ -434,14 +448,15 @@ func runTests(ctx context.Context, attempt int, patterns []string, goTestArgs, t
 					}
 				}
 				ch <- &testAttempt{
-					pkg:          goOutput.Package,
-					outcome:      outcome,
-					start:        pkgTests[""].start,
-					end:          goOutput.Time,
-					logs:         pkgTests[""].logs,
-					pkgFinished:  true,
-					cached:       pkgCached[goOutput.Package],
-					raceDetected: raceDetected,
+					pkg:            goOutput.Package,
+					outcome:        outcome,
+					start:          pkgTests[""].start,
+					end:            goOutput.Time,
+					logs:           pkgTests[""].logs,
+					pkgFinished:    true,
+					binaryFinished: pkgTests[""].binaryFinished,
+					cached:         pkgCached[goOutput.Package],
+					raceDetected:   raceDetected,
 				}
 			case "output":
 				// Capture all output from the package except for the final
@@ -449,8 +464,11 @@ func runTests(ctx context.Context, attempt int, patterns []string, goTestArgs, t
 				// printPkgOutcome will output a similar line
 				if !strings.HasPrefix(goOutput.Output, fmt.Sprintf("FAIL\t%s\t", goOutput.Package)) {
 					pkgTests[""].logs.WriteString(goOutput.Output)
-					if goOutput.Output == raceDetectorMarkerLine {
+					switch goOutput.Output {
+					case raceDetectorMarkerLine:
 						pkgTests[""].raceDetected = true
+					case "PASS\n", "FAIL\n":
+						pkgTests[""].binaryFinished = true
 					}
 				}
 			}
@@ -993,7 +1011,8 @@ func main() {
 		}
 	}
 	var failed []*failedTest
-	var pkgFatal bool // a package produced a non-test fatal (build error, etc.)
+	var pkgFatal bool      // a package produced a non-test fatal (build error, etc.)
+	var goTestExitCode int // exit code of a go test that failed with no retryable tests
 
 	resultsSummary := os.Getenv("TS_TESTWRAPPER_RESULTS_SUMMARY") != ""
 	allResults := map[string]testOutcome{}
@@ -1005,10 +1024,24 @@ func main() {
 			runErrCh <- runTests(ctx, 1, patterns, goTestArgs, testArgs, ch)
 		}()
 
-		// Collect failed tests in this batch on the side; we use the count
-		// when a package reports a fail to decide if the failure is explained
-		// by retryable test failures or is a separate package-level fatal.
+		// Collect failed tests in this batch on the side. When a package
+		// finishes, we use its pkgStates entry to decide if a failure is
+		// explained by retryable test failures or is a separate
+		// package-level fatal.
 		var pkgFailedTests []*failedTest
+		type pkgState struct {
+			failed     []string // tests that go test reported as failed
+			unfinished []string // tests that started but did not finish
+		}
+		pkgStates := map[string]*pkgState{}
+		stateOf := func(pkg string) *pkgState {
+			st, ok := pkgStates[pkg]
+			if !ok {
+				st = new(pkgState)
+				pkgStates[pkg] = st
+			}
+			return st
+		}
 		for tr := range ch {
 			// Go assigns the package name "command-line-arguments" when you
 			// `go test FILE` rather than `go test PKG`. It's more
@@ -1026,35 +1059,70 @@ func main() {
 					// race indicates a real bug that may not even be
 					// in the failing test, and a retry could hide it.
 					// Drop any retry plans for this pkg and fail fast.
-					pkgFailedTests = nil
+					pkgFailedTests = slices.DeleteFunc(pkgFailedTests, func(ft *failedTest) bool {
+						return ft.pkg == tr.pkg
+					})
 					pkgFatal = true
 				}
 				if testingVerbose || tr.outcome == outcomeFail {
 					io.Copy(os.Stdout, &tr.logs)
 				}
-				if tr.outcome == outcomeFail && len(pkgFailedTests) == 0 {
-					// Package failed but no test failed (e.g. the package
-					// timed out, or a build error). Not retryable per-test.
+				st := stateOf(tr.pkg)
+				switch {
+				case tr.outcome == outcomeFail && len(st.failed) == 0 && len(st.unfinished) == 0:
+					// Package failed but no test in it failed (e.g. a build
+					// error, or TestMain exited non-zero). Not retryable per-test.
+					pkgFatal = true
+				case len(st.unfinished) > 0 || (tr.outcome == outcomeFail && !tr.binaryFinished):
+					// The test binary did not complete (e.g. it timed out
+					// or panicked), so some tests possibly did not start.
+					// Retries of single tests can't show that the package
+					// passes, so don't retry any test in it.
+					//
+					// Only a failed package needs to check binaryFinished.
+					// A package can pass or skip without the binary's final
+					// PASS line, for example if it has no test files.
+					var desc []string
+					if len(st.failed) > 0 {
+						slices.Sort(st.failed)
+						desc = append(desc, "failed: "+strings.Join(st.failed, " "))
+					}
+					if len(st.unfinished) > 0 {
+						slices.Sort(st.unfinished)
+						desc = append(desc, "unfinished: "+strings.Join(st.unfinished, " "))
+					}
+					log.Printf("testwrapper: %s did not complete; not retrying its tests (%s)",
+						tr.pkg, strings.Join(desc, "; "))
+					pkgFailedTests = slices.DeleteFunc(pkgFailedTests, func(ft *failedTest) bool {
+						return ft.pkg == tr.pkg
+					})
 					pkgFatal = true
 				}
 				printPkgOutcome(tr.pkg, tr.outcome, tr.cached, tr.end.Sub(tr.start))
 				continue
 			}
+			if testingVerbose || tr.outcome == outcomeFail {
+				io.Copy(os.Stdout, &tr.logs)
+			}
 			if resultsSummary && tr.testName != "" {
 				allResults[tr.pkg+"\t"+tr.testName] = tr.outcome
 			}
-			if testingVerbose || tr.outcome == outcomeFail {
-				io.Copy(os.Stdout, &tr.logs)
+			if tr.inferredFail {
+				// The test did not finish, so it has no result.
+				st := stateOf(tr.pkg)
+				st.unfinished = append(st.unfinished, tr.testName)
+				continue
 			}
 			if tr.outcome != outcomeFail {
 				continue
 			}
+			st := stateOf(tr.pkg)
+			st.failed = append(st.failed, tr.testName)
 			pkgFailedTests = append(pkgFailedTests, &failedTest{
 				pkg:               tr.pkg,
 				testName:          tr.testName,
 				firstFailDuration: tr.end.Sub(tr.start),
 				issueURL:          tr.issueURL, // real if Mark()'d, else "".
-				inferredFail:      tr.inferredFail,
 			})
 		}
 		failed = append(failed, pkgFailedTests...)
@@ -1064,8 +1132,11 @@ func main() {
 			if exit, ok := errors.AsType[*exec.ExitError](err); ok && exit.ExitCode() > -1 {
 				if len(pkgFailedTests) == 0 {
 					// Pure exec failure with no test-level failures to retry:
-					// honor the original exit code.
-					os.Exit(exit.ExitCode())
+					// honor the original exit code. Don't exit yet, so that
+					// we still retry other batches' failures and write the
+					// summaries.
+					goTestExitCode = exit.ExitCode()
+					pkgFatal = true
 				}
 			} else {
 				log.Printf("testwrapper: %s", err)
@@ -1101,13 +1172,7 @@ func main() {
 		if resultsSummary {
 			retried := map[string]bool{}
 			for _, ft := range flaky {
-				key := ft.pkg + "\t" + ft.testName
-				if ft.inferredFail {
-					// It never failed on its own, so it isn't a flake.
-					allResults[key] = outcomePass
-					continue
-				}
-				retried[key] = true
+				retried[ft.pkg+"\t"+ft.testName] = true
 			}
 			writeResultsSummary(path, os.Getenv("TS_TESTWRAPPER_RESULTS_JSON"), os.Getenv("TS_TESTWRAPPER_RESULTS_PKG"), allResults, retried, pkgFatal)
 		}
@@ -1118,6 +1183,6 @@ func main() {
 	}
 
 	if pkgFatal || len(permanent) > 0 {
-		os.Exit(1)
+		os.Exit(cmp.Or(goTestExitCode, 1))
 	}
 }
